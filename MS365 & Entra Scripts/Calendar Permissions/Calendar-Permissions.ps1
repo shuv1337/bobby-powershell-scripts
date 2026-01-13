@@ -13,6 +13,42 @@ try {
     exit 1
 }
 
+# Helper function to get the correct calendar folder name (handles case sensitivity and localization)
+function Get-CalendarFolderName {
+    param($Mailbox)
+    
+    # Common calendar folder name variations (try most common first)
+    $CalendarNames = @("Calendar", "calendar", "CALENDAR", "Kalender", "Calendrier", "Calendario")
+    
+    foreach ($FolderName in $CalendarNames) {
+        try {
+            # Test if this folder name works (we don't need the result, just checking if it succeeds)
+            $null = Get-MailboxFolderPermission -Identity "$Mailbox`:\$FolderName" -ErrorAction Stop -WarningAction SilentlyContinue
+            return $FolderName
+        } catch {
+            # Try next variation
+            continue
+        }
+    }
+    
+    # If none work, try to get folder list and find calendar folder
+    try {
+        $Folders = Get-MailboxFolder -Identity $Mailbox -FolderScope Calendar -ErrorAction SilentlyContinue
+        if ($Folders) {
+            foreach ($Folder in $Folders) {
+                if ($Folder.FolderType -eq "Calendar" -or $Folder.Name -like "*calendar*" -or $Folder.Name -like "*Calendar*") {
+                    return $Folder.Name
+                }
+            }
+        }
+    } catch {
+        # Fallback to default
+    }
+    
+    # Default fallback
+    return "Calendar"
+}
+
 # Function to display calendar permissions
 function Show-CalendarPermissions {
     param($Mailbox)
@@ -20,13 +56,16 @@ function Show-CalendarPermissions {
     Write-Host "`n📅 CALENDAR PERMISSIONS FOR: $Mailbox" -ForegroundColor Cyan
     Write-Host ("=" * 60) -ForegroundColor Cyan
     
+    # Get the correct calendar folder name
+    $CalendarFolder = Get-CalendarFolderName -Mailbox $Mailbox
+    
     try {
-        $Permissions = Get-MailboxFolderPermission -Identity "$Mailbox`:\calendar" -ErrorAction Stop
+        $Permissions = Get-MailboxFolderPermission -Identity "$Mailbox`:\$CalendarFolder" -ErrorAction Stop
         
         # Handle both single object and array results (Measure-Object handles null and single objects)
         if ($null -eq $Permissions -or ($Permissions | Measure-Object).Count -eq 0) {
             Write-Host "No calendar permissions found." -ForegroundColor Yellow
-            return
+            return $true
         }
         
         Write-Host "`nCurrent Calendar Permissions:" -ForegroundColor Yellow
@@ -73,15 +112,18 @@ function Show-CalendarPermissions {
     return $true
 }
 
-# Function to display delegates (used after permission updates to show delegate details)
+# Function to display delegate permissions (shows delegate-specific options and flags)
 function Show-Delegates {
     param($Mailbox)
     
     Write-Host "`n👥 DELEGATES FOR: $Mailbox" -ForegroundColor Cyan
     Write-Host ("=" * 60) -ForegroundColor Cyan
     
+    # Get the correct calendar folder name
+    $CalendarFolder = Get-CalendarFolderName -Mailbox $Mailbox
+    
     try {
-        $Permissions = Get-MailboxFolderPermission -Identity "$Mailbox`:\calendar" -ErrorAction Stop
+        $Permissions = Get-MailboxFolderPermission -Identity "$Mailbox`:\$CalendarFolder" -ErrorAction Stop
         
         # Filter for delegate permissions only
         $Delegates = $Permissions | Where-Object { 
@@ -94,7 +136,7 @@ function Show-Delegates {
         # Handle both single object and array results (Measure-Object handles null and single objects)
         if ($null -eq $Delegates -or ($Delegates | Measure-Object).Count -eq 0) {
             Write-Host "No delegates found." -ForegroundColor Yellow
-            return
+            return $true
         }
         
         Write-Host "`nCurrent Delegates:" -ForegroundColor Yellow
@@ -139,8 +181,11 @@ function Show-DefaultPermission {
     Write-Host "`n🏢 DEFAULT SHARING PERMISSION (Inside your organization)" -ForegroundColor Cyan
     Write-Host ("=" * 60) -ForegroundColor Cyan
     
+    # Get the correct calendar folder name
+    $CalendarFolder = Get-CalendarFolderName -Mailbox $Mailbox
+    
     try {
-        $DefaultPermission = Get-MailboxFolderPermission -Identity "$Mailbox`:\calendar" -User "Default" -ErrorAction Stop
+        $DefaultPermission = Get-MailboxFolderPermission -Identity "$Mailbox`:\$CalendarFolder" -User "Default" -ErrorAction Stop
         
         if ($DefaultPermission) {
             $AccessRights = $DefaultPermission.AccessRights
@@ -170,20 +215,23 @@ function Set-DefaultPermission {
     Write-Host "Default Access Level: $AccessLevel" -ForegroundColor White
     Write-Host "This affects: People in my organization" -ForegroundColor White
     
+    # Get the correct calendar folder name
+    $CalendarFolder = Get-CalendarFolderName -Mailbox $Mailbox
+    
     try {
         # Check if default permission already exists
-        $ExistingPermission = Get-MailboxFolderPermission -Identity "$Mailbox`:\calendar" -User "Default" -ErrorAction SilentlyContinue
+        $ExistingPermission = Get-MailboxFolderPermission -Identity "$Mailbox`:\$CalendarFolder" -User "Default" -ErrorAction SilentlyContinue
         
         if ($ExistingPermission) {
             Write-Host "⚠️  Default permission already exists: $($ExistingPermission.AccessRights)" -ForegroundColor Yellow
             Write-Host "🔄 Updating default permission..." -ForegroundColor Yellow
             
             # Update existing permission
-            Set-MailboxFolderPermission -Identity "$Mailbox`:\calendar" -User "Default" -AccessRights $AccessLevel -Confirm:$false
+            Set-MailboxFolderPermission -Identity "$Mailbox`:\$CalendarFolder" -User "Default" -AccessRights $AccessLevel -Confirm:$false
         } else {
             Write-Host "➕ Adding default permission..." -ForegroundColor Yellow
             # Add new default permission
-            Add-MailboxFolderPermission -Identity "$Mailbox`:\calendar" -User "Default" -AccessRights $AccessLevel -Confirm:$false
+            Add-MailboxFolderPermission -Identity "$Mailbox`:\$CalendarFolder" -User "Default" -AccessRights $AccessLevel -Confirm:$false
         }
         
         Write-Host "✅ Default permission set successfully!" -ForegroundColor Green
@@ -193,6 +241,31 @@ function Set-DefaultPermission {
         Write-Host "❌ Error setting default permission: $($_.Exception.Message)" -ForegroundColor Red
         return $false
     }
+}
+
+# Helper function to check if shared mailbox issue exists (used for error handling)
+function Test-SharedMailboxIssue {
+    param($UserUPN, $Mailbox)
+    
+    try {
+        $UserCheck = Get-Mailbox -Identity $UserUPN -ErrorAction SilentlyContinue
+        if ($UserCheck -and $UserCheck.RecipientTypeDetails -eq "SharedMailbox") {
+            return $true
+        }
+    } catch {
+        # Couldn't check user type, try mailbox
+    }
+    
+    try {
+        $MailboxCheck = Get-Mailbox -Identity $Mailbox -ErrorAction SilentlyContinue
+        if ($MailboxCheck -and $MailboxCheck.RecipientTypeDetails -eq "SharedMailbox") {
+            return $true
+        }
+    } catch {
+        # Couldn't check mailbox type
+    }
+    
+    return $false
 }
 
 # Helper function to get permission map (eliminates code duplication - used in multiple places)
@@ -256,16 +329,19 @@ function Set-CalendarPermission {
         Write-Host "Delegate Flags: $($SharingPermissionFlags -join ', ')" -ForegroundColor White
     }
     
+    # Get the correct calendar folder name
+    $CalendarFolder = Get-CalendarFolderName -Mailbox $Mailbox
+    
     try {
         # Check if user already has permissions (must remove before adding new one to update)
-        $ExistingPermission = Get-MailboxFolderPermission -Identity "$Mailbox`:\calendar" -User $UserUPN -ErrorAction SilentlyContinue
+        $ExistingPermission = Get-MailboxFolderPermission -Identity "$Mailbox`:\$CalendarFolder" -User $UserUPN -ErrorAction SilentlyContinue
         
         if ($ExistingPermission) {
             Write-Host "⚠️  User already has calendar permission: $($ExistingPermission.AccessRights)" -ForegroundColor Yellow
             Write-Host "🔄 Removing existing permission..." -ForegroundColor Yellow
             
-            # Remove existing permission (required before adding updated permission)
-            Remove-MailboxFolderPermission -Identity "$Mailbox`:\calendar" -User $UserUPN -Confirm:$false
+            # Remove existing permission (required before adding updated permission in Exchange Online)
+            Remove-MailboxFolderPermission -Identity "$Mailbox`:\$CalendarFolder" -User $UserUPN -Confirm:$false
             Write-Host "✅ Existing permission removed" -ForegroundColor Green
         }
         
@@ -273,9 +349,9 @@ function Set-CalendarPermission {
         Write-Host "➕ Adding new permission..." -ForegroundColor Yellow
         
         if ($SharingPermissionFlags.Count -gt 0) {
-            Add-MailboxFolderPermission -Identity "$Mailbox`:\calendar" -User $UserUPN -AccessRights $AccessLevel -SharingPermissionFlags $SharingPermissionFlags -Confirm:$false
+            Add-MailboxFolderPermission -Identity "$Mailbox`:\$CalendarFolder" -User $UserUPN -AccessRights $AccessLevel -SharingPermissionFlags $SharingPermissionFlags -Confirm:$false
         } else {
-            Add-MailboxFolderPermission -Identity "$Mailbox`:\calendar" -User $UserUPN -AccessRights $AccessLevel -Confirm:$false
+            Add-MailboxFolderPermission -Identity "$Mailbox`:\$CalendarFolder" -User $UserUPN -AccessRights $AccessLevel -Confirm:$false
         }
         
         Write-Host "✅ Permission set successfully!" -ForegroundColor Green
@@ -325,12 +401,23 @@ function Remove-CalendarPermission {
     Write-Host "Mailbox: $Mailbox" -ForegroundColor White
     Write-Host "User: $UserUPN" -ForegroundColor White
     
+    # Get the correct calendar folder name
+    $CalendarFolder = Get-CalendarFolderName -Mailbox $Mailbox
+    
     try {
         # Check if user has permissions
-        $ExistingPermission = Get-MailboxFolderPermission -Identity "$Mailbox`:\calendar" -User $UserUPN -ErrorAction SilentlyContinue
+        $ExistingPermission = Get-MailboxFolderPermission -Identity "$Mailbox`:\$CalendarFolder" -User $UserUPN -ErrorAction SilentlyContinue
         
         if (-not $ExistingPermission) {
-            Write-Host "⚠️  User does not have calendar permission to remove" -ForegroundColor Yellow
+            # Check if the user or mailbox is a shared mailbox (known limitation)
+            $IsSharedMailboxIssue = Test-SharedMailboxIssue -UserUPN $UserUPN -Mailbox $Mailbox
+            
+            if ($IsSharedMailboxIssue) {
+                Write-Host "❌ Permission removal failed. Possible Reason: SharedMailbox - please remove manually" -ForegroundColor Red
+            } else {
+                Write-Host "❌ Permission removal failed. Please try again" -ForegroundColor Red
+            }
+            
             return $false
         }
         
@@ -338,12 +425,20 @@ function Remove-CalendarPermission {
         Write-Host "🔄 Removing calendar permission..." -ForegroundColor Yellow
         
         # Remove permission
-        Remove-MailboxFolderPermission -Identity "$Mailbox`:\calendar" -User $UserUPN -Confirm:$false
+        Remove-MailboxFolderPermission -Identity "$Mailbox`:\$CalendarFolder" -User $UserUPN -Confirm:$false
         Write-Host "✅ Calendar permission removed successfully!" -ForegroundColor Green
         return $true
         
     } catch {
-        Write-Host "❌ Error removing permission: $($_.Exception.Message)" -ForegroundColor Red
+        # Check if the user or mailbox is a shared mailbox (known limitation)
+        $IsSharedMailboxIssue = Test-SharedMailboxIssue -UserUPN $UserUPN -Mailbox $Mailbox
+        
+        if ($IsSharedMailboxIssue) {
+            Write-Host "❌ Permission removal failed. Possible Reason: SharedMailbox - please remove manually" -ForegroundColor Red
+        } else {
+            Write-Host "❌ Permission removal failed. Please try again" -ForegroundColor Red
+        }
+        
         return $false
     }
 }
@@ -383,7 +478,7 @@ do {
         continue
     }
 
-    # Step 2: Show current calendar permissions (includes delegates marked with [DELEGATE] tag)
+    # Step 2: Show current calendar permissions (delegates are marked with [DELEGATE] tag)
     Write-Host "`n📅 Step 2: Current Calendar Permissions" -ForegroundColor Yellow
     $PermissionsRetrieved = Show-CalendarPermissions -Mailbox $Mailbox
 
@@ -397,7 +492,7 @@ do {
     }
 
     Write-Host "`n🏢 Step 2b: Default Sharing Permission" -ForegroundColor Yellow
-    Show-DefaultPermission -Mailbox $Mailbox
+    $null = Show-DefaultPermission -Mailbox $Mailbox
 
     # Step 3: Ask what action to take
     Write-Host "`n❓ Step 3: What would you like to do?" -ForegroundColor Yellow
@@ -567,7 +662,7 @@ do {
             # Step 8: Show updated permissions and delegates
             Write-Host "`n📅 Step 8: Updated Calendar Permissions" -ForegroundColor Yellow
             Show-CalendarPermissions -Mailbox $Mailbox
-            Show-Delegates -Mailbox $Mailbox
+            $null = Show-Delegates -Mailbox $Mailbox
             
             Write-Host "`n🎉 DELEGATE PERMISSION UPDATE COMPLETE!" -ForegroundColor Green
             Write-Host ("=" * 50) -ForegroundColor Green
@@ -607,7 +702,7 @@ do {
         if ($Success) {
             # Step 6: Show updated default permission
             Write-Host "`n🏢 Step 6: Updated Default Sharing Permission" -ForegroundColor Yellow
-            Show-DefaultPermission -Mailbox $Mailbox
+            $null = Show-DefaultPermission -Mailbox $Mailbox
             
             Write-Host "`n🎉 DEFAULT PERMISSION UPDATE COMPLETE!" -ForegroundColor Green
             Write-Host ("=" * 50) -ForegroundColor Green
@@ -619,8 +714,10 @@ do {
         }
     } else {
         # Remove permission - check if user is a delegate and show appropriate warnings
+        $CalendarFolder = Get-CalendarFolderName -Mailbox $Mailbox
+        
         try {
-            $ExistingPermission = Get-MailboxFolderPermission -Identity "$Mailbox`:\calendar" -User $UserUPN -ErrorAction SilentlyContinue
+            $ExistingPermission = Get-MailboxFolderPermission -Identity "$Mailbox`:\$CalendarFolder" -User $UserUPN -ErrorAction SilentlyContinue
             $IsDelegate = $false
             
             if ($ExistingPermission -and $ExistingPermission.SharingPermissionFlags -like "*Delegate*") {
@@ -640,7 +737,7 @@ do {
                 }
             }
         } catch {
-            # If we can't check, proceed anyway
+            # If we can't check for delegate status, proceed with removal anyway
         }
         
         Write-Host "`n🔧 Step 5: Removing permission..." -ForegroundColor Yellow
@@ -653,7 +750,7 @@ do {
             
             # Show delegates if this was a delegate removal
             if ($IsDelegate) {
-                Show-Delegates -Mailbox $Mailbox
+                $null = Show-Delegates -Mailbox $Mailbox
             }
             
             Write-Host "`n🎉 CALENDAR PERMISSION REMOVAL COMPLETE!" -ForegroundColor Green
@@ -665,9 +762,8 @@ do {
                 Write-Host "✅ Action: Calendar permission removed" -ForegroundColor White
             }
             Write-Host "✅ Mailbox: $Mailbox" -ForegroundColor White
-        } else {
-            Write-Host "`n❌ Permission removal failed. Please try again." -ForegroundColor Red
         }
+        # Error messages are already displayed by Remove-CalendarPermission function
     }
 
     # Ask if user wants to run again
