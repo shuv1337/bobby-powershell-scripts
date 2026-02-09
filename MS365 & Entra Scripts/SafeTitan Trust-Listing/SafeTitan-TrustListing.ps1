@@ -5,29 +5,27 @@
     Applies SafeTitan (TitanHQ) trust-listing configuration across multiple Office 365 tenants.
 
 .DESCRIPTION
-    Automates the 3-step SafeTitan trust-listing process from the TitanHQ guide:
-      Step 1: Add SafeTitan IP to Connection Filter Allow List (Anti-Spam)
-      Step 2: Create transport rule — bypass spam by sender IP + bypass Clutter
-      Step 3: Create transport rule — bypass spam by DMARC + domains + sender IP
+    Automates SafeTitan trust-listing steps across Exchange Online / Defender:
+      1) Connection filter allow IP
+      2) Transport rule: bypass spam + BypassClutter header
+      3) Transport rule: DMARC + SafeTitan domains + sender IP
+      4) Transport rule: skip junk header (X-Forefront-Antispam-Report)
+      5) Transport rule: skip Safe Attachments header
+      6) Transport rule: skip Safe Links header
+      7) Anti-Phishing default policy trusted domains
+      8) Advanced Delivery phishing simulation (domains + sender IP)
 
-    Uses device code authentication so you can paste the auth URL into a browser
-    profile that is already logged into each tenant's admin account.
-
-    The script is fully idempotent — it checks for existing configuration before
-    making changes and skips anything already in place.
-
-    Reference: https://help.safe.titanhq.com/support/solutions/articles/4000183650
+    Uses device code authentication so you can paste auth URL/code into a browser
+    profile already signed into each tenant admin account.
 
 .PARAMETER DryRun
-    Show what would be changed without making any modifications.
+    Show what would change without making modifications.
 
 .PARAMETER Force
-    Re-create transport rules even if they already exist (deletes and recreates).
+    Re-create transport rules if they exist.
 
 .NOTES
-    Author:   Bobby / Latitudes Team
-    Requires: ExchangeOnlineManagement module v3.2+
-              Global Admin or Exchange Admin role on each tenant
+    Requires: ExchangeOnlineManagement module (v3.2+ recommended)
 #>
 
 param (
@@ -35,11 +33,7 @@ param (
     [switch]$Force
 )
 
-# ╔══════════════════════════════════════════════════════════════════════════════╗
-# ║                            CONFIGURATION                                   ║
-# ╚══════════════════════════════════════════════════════════════════════════════╝
-
-#region SafeTitan Constants — update if TitanHQ changes IPs or domains
+#region Constants
 
 $SafeTitanIP = "204.220.164.253"
 
@@ -73,27 +67,30 @@ $SafeTitanDomains = @(
     "keeper-secure.com"
 )
 
-# Transport rule names — used for idempotency checks
-$RuleName_IPBypass    = "SafeTitan - Bypass Spam (Sender IP)"
-$RuleName_DMARCBypass = "SafeTitan - DMARC Bypass (Domains + IP)"
+# Advanced Delivery currently allows up to 20 sending domains.
+# Keep this list to 20 max (first 20 by default).
+$AdvancedDeliveryDomains = $SafeTitanDomains | Select-Object -First 20
+
+$RuleName_IPBypass          = "SafeTitan - Bypass Spam (Sender IP)"
+$RuleName_DMARCBypass       = "SafeTitan - DMARC Bypass (Domains + IP)"
+$RuleName_SkipJunkHeader    = "SafeTitan - Skip Junk Header"
+$RuleName_SkipAttachments   = "SafeTitan - Bypass ATP Attachments"
+$RuleName_SkipLinks         = "SafeTitan - Bypass ATP Link Processing"
+
+$PhishSimPolicyName         = "SafeTitan Phishing Simulation Override"
 
 #endregion
 
-#region Tenant List — add/remove customer tenant domains here
+#region Tenant List
 
 $Tenants = @(
     # "customer1.onmicrosoft.com"
     # "customer2.onmicrosoft.com"
-    # "customer3.onmicrosoft.com"
 )
 
 #endregion
 
-# ╔══════════════════════════════════════════════════════════════════════════════╗
-# ║                              LOGGING                                       ║
-# ╚══════════════════════════════════════════════════════════════════════════════╝
-
-#region Logging Setup
+#region Logging
 
 $logDir = Join-Path $PSScriptRoot "logs"
 if (-not (Test-Path $logDir)) {
@@ -102,12 +99,10 @@ if (-not (Test-Path $logDir)) {
 
 $runTimestamp = Get-Date -Format "yyyyMMdd-HHmmss"
 $logFile = Join-Path $logDir "SafeTitan-TrustList-$runTimestamp.csv"
-
-# Seed log file with header row only
 "Timestamp,Tenant,Step,Status,Detail" | Set-Content -Path $logFile
 
 function Write-Log {
-    param (
+    param(
         [string]$Tenant,
         [string]$Step,
         [ValidateSet("Success", "Skipped", "Failed", "Info")]
@@ -116,18 +111,13 @@ function Write-Log {
     )
 
     $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-    # Escape quotes in detail for CSV safety
     $safeDetail = $Detail -replace '"', '""'
     "`"$ts`",`"$Tenant`",`"$Step`",`"$Status`",`"$safeDetail`"" | Add-Content -Path $logFile
 }
 
 #endregion
 
-# ╔══════════════════════════════════════════════════════════════════════════════╗
-# ║                         MODULE PREFLIGHT                                   ║
-# ╚══════════════════════════════════════════════════════════════════════════════╝
-
-#region Module Check
+#region Preconditions
 
 function Assert-ExchangeModule {
     $mod = Get-Module -ListAvailable -Name ExchangeOnlineManagement |
@@ -135,53 +125,98 @@ function Assert-ExchangeModule {
 
     if (-not $mod) {
         Write-Host "❌ ExchangeOnlineManagement module is not installed." -ForegroundColor Red
-        Write-Host "   Install it with:  Install-Module ExchangeOnlineManagement -Scope CurrentUser" -ForegroundColor Yellow
+        Write-Host "Install with: Install-Module ExchangeOnlineManagement -Scope CurrentUser" -ForegroundColor Yellow
         exit 1
     }
 
-    if ($mod.Version -lt [Version]"3.2.0") {
-        Write-Host "⚠️  ExchangeOnlineManagement v$($mod.Version) found — v3.2+ recommended for -Device auth." -ForegroundColor Yellow
-        Write-Host "   Update with:  Update-Module ExchangeOnlineManagement -Force" -ForegroundColor Yellow
+    Write-Host "✓ ExchangeOnlineManagement v$($mod.Version)" -ForegroundColor Green
+}
+
+function Test-CmdletAvailable {
+    param([string]$Name)
+    return [bool](Get-Command -Name $Name -ErrorAction SilentlyContinue)
+}
+
+#endregion
+
+#region Step Helpers
+
+function Ensure-TransportRule {
+    param(
+        [string]$Tenant,
+        [string]$StepName,
+        [string]$RuleName,
+        [scriptblock]$CreateAction
+    )
+
+    try {
+        $existing = Get-TransportRule -Identity $RuleName -ErrorAction SilentlyContinue
+
+        if ($existing -and -not $Force) {
+            Write-Host "  ✓ Rule '$RuleName' already exists — skipping" -ForegroundColor Green
+            Write-Log -Tenant $Tenant -Step $StepName -Status "Skipped" -Detail "Rule already exists"
+            return $true
+        }
+
+        if ($existing -and $Force) {
+            if ($DryRun) {
+                Write-Host "  🔍 [DRY RUN] Would recreate '$RuleName'" -ForegroundColor Yellow
+                Write-Log -Tenant $Tenant -Step $StepName -Status "Info" -Detail "DRY RUN — would recreate rule"
+                return $true
+            }
+
+            Remove-TransportRule -Identity $RuleName -Confirm:$false -ErrorAction Stop
+            Write-Log -Tenant $Tenant -Step $StepName -Status "Info" -Detail "Removed existing rule (-Force)"
+        }
+
+        if ($DryRun) {
+            Write-Host "  🔍 [DRY RUN] Would create '$RuleName'" -ForegroundColor Yellow
+            Write-Log -Tenant $Tenant -Step $StepName -Status "Info" -Detail "DRY RUN — would create rule"
+            return $true
+        }
+
+        & $CreateAction
+
+        Write-Host "  ✓ Created '$RuleName'" -ForegroundColor Green
+        Write-Log -Tenant $Tenant -Step $StepName -Status "Success" -Detail "Rule created"
+        return $true
     }
-    else {
-        Write-Host "✓ ExchangeOnlineManagement v$($mod.Version)" -ForegroundColor Green
+    catch {
+        Write-Host "  ✗ Failed: $($_.Exception.Message)" -ForegroundColor Red
+        Write-Log -Tenant $Tenant -Step $StepName -Status "Failed" -Detail $_.Exception.Message
+        return $false
     }
 }
 
 #endregion
 
-# ╔══════════════════════════════════════════════════════════════════════════════╗
-# ║                     STEP 1 — CONNECTION FILTER                             ║
-# ╚══════════════════════════════════════════════════════════════════════════════╝
-
-#region Step 1
+#region Step 1-8
 
 function Set-Step1_ConnectionFilterIP {
-    param ([string]$Tenant)
+    param([string]$Tenant)
 
-    Write-Host "`n  ── Step 1: Connection Filter IP Allow List ──" -ForegroundColor Cyan
+    Write-Host "`n  ── Step 1: Connection Filter allow IP ──" -ForegroundColor Cyan
 
     try {
         $policy = Get-HostedConnectionFilterPolicy -Identity Default -ErrorAction Stop
         $currentIPs = @($policy.IPAllowList)
 
         if ($currentIPs -contains $SafeTitanIP) {
-            Write-Host "  ✓ IP $SafeTitanIP already in allow list — skipping" -ForegroundColor Green
+            Write-Host "  ✓ IP already present" -ForegroundColor Green
             Write-Log -Tenant $Tenant -Step "Step1-ConnectionFilter" -Status "Skipped" -Detail "IP already present"
             return $true
         }
 
         if ($DryRun) {
-            Write-Host "  🔍 [DRY RUN] Would add $SafeTitanIP to allow list (current: $($currentIPs -join ', '))" -ForegroundColor Yellow
+            Write-Host "  🔍 [DRY RUN] Would add $SafeTitanIP" -ForegroundColor Yellow
             Write-Log -Tenant $Tenant -Step "Step1-ConnectionFilter" -Status "Info" -Detail "DRY RUN — would add IP"
             return $true
         }
 
-        $newIPs = $currentIPs + $SafeTitanIP
-        Set-HostedConnectionFilterPolicy -Identity Default -IPAllowList $newIPs -ErrorAction Stop
+        Set-HostedConnectionFilterPolicy -Identity Default -IPAllowList ($currentIPs + $SafeTitanIP) -ErrorAction Stop
 
-        Write-Host "  ✓ Added $SafeTitanIP to Connection Filter allow list" -ForegroundColor Green
-        Write-Log -Tenant $Tenant -Step "Step1-ConnectionFilter" -Status "Success" -Detail "Added IP $SafeTitanIP"
+        Write-Host "  ✓ Added $SafeTitanIP" -ForegroundColor Green
+        Write-Log -Tenant $Tenant -Step "Step1-ConnectionFilter" -Status "Success" -Detail "Added IP"
         return $true
     }
     catch {
@@ -191,46 +226,12 @@ function Set-Step1_ConnectionFilterIP {
     }
 }
 
-#endregion
-
-# ╔══════════════════════════════════════════════════════════════════════════════╗
-# ║           STEP 2 — TRANSPORT RULE: BYPASS SPAM (SENDER IP)                ║
-# ╚══════════════════════════════════════════════════════════════════════════════╝
-
-#region Step 2
-
 function Set-Step2_IPBypassRule {
-    param ([string]$Tenant)
+    param([string]$Tenant)
 
-    Write-Host "`n  ── Step 2: Transport Rule — Bypass Spam (Sender IP) ──" -ForegroundColor Cyan
+    Write-Host "`n  ── Step 2: Rule (bypass spam + BypassClutter) ──" -ForegroundColor Cyan
 
-    try {
-        $existing = Get-TransportRule -Identity $RuleName_IPBypass -ErrorAction SilentlyContinue
-
-        if ($existing -and -not $Force) {
-            Write-Host "  ✓ Rule '$RuleName_IPBypass' already exists — skipping (use -Force to recreate)" -ForegroundColor Green
-            Write-Log -Tenant $Tenant -Step "Step2-IPBypassRule" -Status "Skipped" -Detail "Rule already exists"
-            return $true
-        }
-
-        if ($existing -and $Force) {
-            if ($DryRun) {
-                Write-Host "  🔍 [DRY RUN] Would delete and recreate rule '$RuleName_IPBypass'" -ForegroundColor Yellow
-                Write-Log -Tenant $Tenant -Step "Step2-IPBypassRule" -Status "Info" -Detail "DRY RUN — would recreate rule"
-                return $true
-            }
-            Write-Host "  🔄 -Force: Removing existing rule before recreating..." -ForegroundColor Yellow
-            Remove-TransportRule -Identity $RuleName_IPBypass -Confirm:$false -ErrorAction Stop
-            Write-Log -Tenant $Tenant -Step "Step2-IPBypassRule" -Status "Info" -Detail "Removed existing rule (-Force)"
-        }
-
-        if ($DryRun) {
-            Write-Host "  🔍 [DRY RUN] Would create rule '$RuleName_IPBypass'" -ForegroundColor Yellow
-            Write-Host "     Sender IP: $SafeTitanIP | SCL: -1 | BypassClutter: true" -ForegroundColor Gray
-            Write-Log -Tenant $Tenant -Step "Step2-IPBypassRule" -Status "Info" -Detail "DRY RUN — would create rule"
-            return $true
-        }
-
+    return Ensure-TransportRule -Tenant $Tenant -StepName "Step2-IPBypassRule" -RuleName $RuleName_IPBypass -CreateAction {
         New-TransportRule -Name $RuleName_IPBypass `
             -SenderIpRanges $SafeTitanIP `
             -SetSCL -1 `
@@ -238,60 +239,15 @@ function Set-Step2_IPBypassRule {
             -SetHeaderValue "true" `
             -Priority 0 `
             -ErrorAction Stop
-
-        Write-Host "  ✓ Created rule '$RuleName_IPBypass'" -ForegroundColor Green
-        Write-Log -Tenant $Tenant -Step "Step2-IPBypassRule" -Status "Success" -Detail "Rule created"
-        return $true
-    }
-    catch {
-        Write-Host "  ✗ Failed: $($_.Exception.Message)" -ForegroundColor Red
-        Write-Log -Tenant $Tenant -Step "Step2-IPBypassRule" -Status "Failed" -Detail $_.Exception.Message
-        return $false
     }
 }
 
-#endregion
-
-# ╔══════════════════════════════════════════════════════════════════════════════╗
-# ║        STEP 3 — TRANSPORT RULE: DMARC BYPASS (DOMAINS + IP)               ║
-# ╚══════════════════════════════════════════════════════════════════════════════╝
-
-#region Step 3
-
 function Set-Step3_DMARCBypassRule {
-    param ([string]$Tenant)
+    param([string]$Tenant)
 
-    Write-Host "`n  ── Step 3: Transport Rule — DMARC Bypass (Domains + IP) ──" -ForegroundColor Cyan
+    Write-Host "`n  ── Step 3: Rule (DMARC + domains + IP) ──" -ForegroundColor Cyan
 
-    try {
-        $existing = Get-TransportRule -Identity $RuleName_DMARCBypass -ErrorAction SilentlyContinue
-
-        if ($existing -and -not $Force) {
-            Write-Host "  ✓ Rule '$RuleName_DMARCBypass' already exists — skipping (use -Force to recreate)" -ForegroundColor Green
-            Write-Log -Tenant $Tenant -Step "Step3-DMARCBypassRule" -Status "Skipped" -Detail "Rule already exists"
-            return $true
-        }
-
-        if ($existing -and $Force) {
-            if ($DryRun) {
-                Write-Host "  🔍 [DRY RUN] Would delete and recreate rule '$RuleName_DMARCBypass'" -ForegroundColor Yellow
-                Write-Log -Tenant $Tenant -Step "Step3-DMARCBypassRule" -Status "Info" -Detail "DRY RUN — would recreate rule"
-                return $true
-            }
-            Write-Host "  🔄 -Force: Removing existing rule before recreating..." -ForegroundColor Yellow
-            Remove-TransportRule -Identity $RuleName_DMARCBypass -Confirm:$false -ErrorAction Stop
-            Write-Log -Tenant $Tenant -Step "Step3-DMARCBypassRule" -Status "Info" -Detail "Removed existing rule (-Force)"
-        }
-
-        if ($DryRun) {
-            Write-Host "  🔍 [DRY RUN] Would create rule '$RuleName_DMARCBypass'" -ForegroundColor Yellow
-            Write-Host "     Domains: $($SafeTitanDomains.Count) | Sender IP: $SafeTitanIP" -ForegroundColor Gray
-            Write-Host "     DMARC header match: dmarc=pass, dmarc=bestguesspass" -ForegroundColor Gray
-            Write-Host "     SCL: -1 | X-ETR header set" -ForegroundColor Gray
-            Write-Log -Tenant $Tenant -Step "Step3-DMARCBypassRule" -Status "Info" -Detail "DRY RUN — would create rule"
-            return $true
-        }
-
+    return Ensure-TransportRule -Tenant $Tenant -StepName "Step3-DMARCBypassRule" -RuleName $RuleName_DMARCBypass -CreateAction {
         New-TransportRule -Name $RuleName_DMARCBypass `
             -SenderDomainIs $SafeTitanDomains `
             -FromScope "NotInOrganization" `
@@ -303,23 +259,188 @@ function Set-Step3_DMARCBypassRule {
             -SetHeaderValue "Bypass spam filtering for authenticated SafeTitan domains" `
             -Priority 1 `
             -ErrorAction Stop
+    }
+}
 
-        Write-Host "  ✓ Created rule '$RuleName_DMARCBypass'" -ForegroundColor Green
-        Write-Log -Tenant $Tenant -Step "Step3-DMARCBypassRule" -Status "Success" -Detail "Rule created with $($SafeTitanDomains.Count) domains"
+function Set-Step4_SkipJunkHeaderRule {
+    param([string]$Tenant)
+
+    Write-Host "`n  ── Step 4: Rule (X-Forefront-Antispam-Report: SFV:SKI;) ──" -ForegroundColor Cyan
+
+    return Ensure-TransportRule -Tenant $Tenant -StepName "Step4-SkipJunkHeaderRule" -RuleName $RuleName_SkipJunkHeader -CreateAction {
+        New-TransportRule -Name $RuleName_SkipJunkHeader `
+            -SenderIpRanges $SafeTitanIP `
+            -SetSCL -1 `
+            -SetHeaderName "X-Forefront-Antispam-Report" `
+            -SetHeaderValue "SFV:SKI;" `
+            -Priority 2 `
+            -ErrorAction Stop
+    }
+}
+
+function Set-Step5_AttachmentBypassRule {
+    param([string]$Tenant)
+
+    Write-Host "`n  ── Step 5: Rule (Skip Safe Attachments) ──" -ForegroundColor Cyan
+
+    return Ensure-TransportRule -Tenant $Tenant -StepName "Step5-AttachmentBypassRule" -RuleName $RuleName_SkipAttachments -CreateAction {
+        New-TransportRule -Name $RuleName_SkipAttachments `
+            -SenderIpRanges $SafeTitanIP `
+            -SetHeaderName "X-MS-Exchange-Organization-SkipSafeAttachmentProcessing" `
+            -SetHeaderValue "1" `
+            -Priority 3 `
+            -ErrorAction Stop
+    }
+}
+
+function Set-Step6_LinkBypassRule {
+    param([string]$Tenant)
+
+    Write-Host "`n  ── Step 6: Rule (Skip Safe Links) ──" -ForegroundColor Cyan
+
+    return Ensure-TransportRule -Tenant $Tenant -StepName "Step6-LinkBypassRule" -RuleName $RuleName_SkipLinks -CreateAction {
+        New-TransportRule -Name $RuleName_SkipLinks `
+            -SenderIpRanges $SafeTitanIP `
+            -SetHeaderName "X-MS-Exchange-Organization-SkipSafeLinksProcessing" `
+            -SetHeaderValue "1" `
+            -Priority 4 `
+            -ErrorAction Stop
+    }
+}
+
+function Set-Step7_AntiPhishTrustedDomains {
+    param([string]$Tenant)
+
+    Write-Host "`n  ── Step 7: Anti-Phish default trusted domains ──" -ForegroundColor Cyan
+
+    try {
+        if (-not (Test-CmdletAvailable -Name "Get-AntiPhishPolicy") -or -not (Test-CmdletAvailable -Name "Set-AntiPhishPolicy")) {
+            Write-Host "  ⚠️  AntiPhish cmdlets not available in this session — skipping" -ForegroundColor Yellow
+            Write-Log -Tenant $Tenant -Step "Step7-AntiPhishTrustedDomains" -Status "Skipped" -Detail "Cmdlets not available"
+            return $true
+        }
+
+        $policy = Get-AntiPhishPolicy | Where-Object { $_.IsDefault -eq $true } | Select-Object -First 1
+        if (-not $policy) {
+            $policy = Get-AntiPhishPolicy -Identity "Office365 AntiPhish Default" -ErrorAction SilentlyContinue
+        }
+
+        if (-not $policy) {
+            throw "Could not locate default anti-phishing policy."
+        }
+
+        $existingDomains = @($policy.ExcludedDomains)
+        $missingDomains = $SafeTitanDomains | Where-Object { $_ -notin $existingDomains }
+
+        if ($missingDomains.Count -eq 0) {
+            Write-Host "  ✓ All SafeTitan domains already trusted in default AntiPhish policy" -ForegroundColor Green
+            Write-Log -Tenant $Tenant -Step "Step7-AntiPhishTrustedDomains" -Status "Skipped" -Detail "Domains already present"
+            return $true
+        }
+
+        if ($DryRun) {
+            Write-Host "  🔍 [DRY RUN] Would add $($missingDomains.Count) domains to '$($policy.Name)'" -ForegroundColor Yellow
+            Write-Log -Tenant $Tenant -Step "Step7-AntiPhishTrustedDomains" -Status "Info" -Detail "DRY RUN — would add $($missingDomains.Count) domains"
+            return $true
+        }
+
+        foreach ($d in $missingDomains) {
+            Set-AntiPhishPolicy -Identity $policy.Identity -ExcludedDomains @{Add = $d} -ErrorAction Stop
+        }
+
+        Write-Host "  ✓ Added $($missingDomains.Count) trusted domains to AntiPhish default policy" -ForegroundColor Green
+        Write-Log -Tenant $Tenant -Step "Step7-AntiPhishTrustedDomains" -Status "Success" -Detail "Added $($missingDomains.Count) domains"
         return $true
     }
     catch {
         Write-Host "  ✗ Failed: $($_.Exception.Message)" -ForegroundColor Red
-        Write-Log -Tenant $Tenant -Step "Step3-DMARCBypassRule" -Status "Failed" -Detail $_.Exception.Message
+        Write-Log -Tenant $Tenant -Step "Step7-AntiPhishTrustedDomains" -Status "Failed" -Detail $_.Exception.Message
+        return $false
+    }
+}
+
+function Set-Step8_AdvancedDeliveryPhishSim {
+    param([string]$Tenant)
+
+    Write-Host "`n  ── Step 8: Advanced Delivery (Phishing Simulation) ──" -ForegroundColor Cyan
+
+    try {
+        if (-not (Test-CmdletAvailable -Name "Get-PhishSimOverridePolicy")) {
+            Write-Host "  ⚠️  PhishSim cmdlets not available in EXO session. Trying IPPS session..." -ForegroundColor Yellow
+
+            if ($DryRun) {
+                Write-Host "  🔍 [DRY RUN] Would connect IPPS and configure PhishSim override policy/rule" -ForegroundColor Yellow
+                Write-Log -Tenant $Tenant -Step "Step8-AdvancedDelivery" -Status "Info" -Detail "DRY RUN — would connect IPPS and configure"
+                return $true
+            }
+
+            Connect-IPPSSession -Device -ErrorAction Stop | Out-Null
+        }
+
+        $policy = Get-PhishSimOverridePolicy -Identity $PhishSimPolicyName -ErrorAction SilentlyContinue
+
+        if (-not $policy) {
+            if ($DryRun) {
+                Write-Host "  🔍 [DRY RUN] Would create PhishSim policy '$PhishSimPolicyName'" -ForegroundColor Yellow
+                Write-Log -Tenant $Tenant -Step "Step8-AdvancedDelivery" -Status "Info" -Detail "DRY RUN — would create policy"
+                return $true
+            }
+
+            New-PhishSimOverridePolicy -Name $PhishSimPolicyName -ErrorAction Stop | Out-Null
+            $policy = Get-PhishSimOverridePolicy -Identity $PhishSimPolicyName -ErrorAction Stop
+            Write-Log -Tenant $Tenant -Step "Step8-AdvancedDelivery" -Status "Info" -Detail "Created policy '$PhishSimPolicyName'"
+        }
+
+        $rules = Get-PhishSimOverrideRule -ErrorAction SilentlyContinue
+        $matchingRule = $rules | Where-Object {
+            (@($_.SenderIPRanges) -contains $SafeTitanIP) -and
+            (@($_.Domains) | Where-Object { $_ -in $AdvancedDeliveryDomains }).Count -ge 1
+        } | Select-Object -First 1
+
+        if ($matchingRule -and -not $Force) {
+            Write-Host "  ✓ Existing Advanced Delivery override rule already found — skipping" -ForegroundColor Green
+            Write-Log -Tenant $Tenant -Step "Step8-AdvancedDelivery" -Status "Skipped" -Detail "Matching rule already exists"
+            return $true
+        }
+
+        if ($matchingRule -and $Force) {
+            if ($DryRun) {
+                Write-Host "  🔍 [DRY RUN] Would remove/recreate existing PhishSim override rule" -ForegroundColor Yellow
+                Write-Log -Tenant $Tenant -Step "Step8-AdvancedDelivery" -Status "Info" -Detail "DRY RUN — would recreate rule"
+                return $true
+            }
+            Remove-PhishSimOverrideRule -Identity $matchingRule.Identity -Confirm:$false -ErrorAction Stop
+            Write-Log -Tenant $Tenant -Step "Step8-AdvancedDelivery" -Status "Info" -Detail "Removed existing matching rule (-Force)"
+        }
+
+        if ($DryRun) {
+            Write-Host "  🔍 [DRY RUN] Would create Advanced Delivery override rule" -ForegroundColor Yellow
+            Write-Host "     Domains: $($AdvancedDeliveryDomains.Count) (limit 20), Sender IP: $SafeTitanIP" -ForegroundColor Gray
+            Write-Log -Tenant $Tenant -Step "Step8-AdvancedDelivery" -Status "Info" -Detail "DRY RUN — would create rule"
+            return $true
+        }
+
+        if (Test-CmdletAvailable -Name "New-ExoPhishSimOverrideRule") {
+            New-ExoPhishSimOverrideRule -Policy $PhishSimPolicyName -Domains $AdvancedDeliveryDomains -SenderIpRanges $SafeTitanIP -ErrorAction Stop | Out-Null
+        }
+        else {
+            # Fallback name (older docs/cmdlet alias)
+            New-PhishSimOverrideRule -Policy $PhishSimPolicyName -Domains $AdvancedDeliveryDomains -SenderIpRanges $SafeTitanIP -ErrorAction Stop | Out-Null
+        }
+
+        Write-Host "  ✓ Advanced Delivery phishing simulation override configured" -ForegroundColor Green
+        Write-Host "  ℹ️  Used $($AdvancedDeliveryDomains.Count) domains (Advanced Delivery max is 20)" -ForegroundColor Gray
+        Write-Log -Tenant $Tenant -Step "Step8-AdvancedDelivery" -Status "Success" -Detail "Configured with $($AdvancedDeliveryDomains.Count) domains + IP"
+        return $true
+    }
+    catch {
+        Write-Host "  ✗ Failed: $($_.Exception.Message)" -ForegroundColor Red
+        Write-Log -Tenant $Tenant -Step "Step8-AdvancedDelivery" -Status "Failed" -Detail $_.Exception.Message
         return $false
     }
 }
 
 #endregion
-
-# ╔══════════════════════════════════════════════════════════════════════════════╗
-# ║                             MAIN                                           ║
-# ╚══════════════════════════════════════════════════════════════════════════════╝
 
 #region Main
 
@@ -330,177 +451,102 @@ function Main {
     Write-Host "║      SafeTitan Trust-Listing — Multi-Tenant Deployment      ║" -ForegroundColor Cyan
     Write-Host "╚══════════════════════════════════════════════════════════════╝" -ForegroundColor Cyan
 
-    if ($DryRun) {
-        Write-Host "`n  🔍 DRY RUN MODE — no changes will be made" -ForegroundColor Yellow
-    }
-    if ($Force) {
-        Write-Host "  ⚡ FORCE MODE — existing rules will be deleted and recreated" -ForegroundColor Yellow
-    }
+    if ($DryRun) { Write-Host "`n  🔍 DRY RUN MODE" -ForegroundColor Yellow }
+    if ($Force)  { Write-Host "  ⚡ FORCE MODE (recreate existing rules)" -ForegroundColor Yellow }
 
-    Write-Host ""
     Assert-ExchangeModule
 
-    # ── Validate tenant list ──
     if ($Tenants.Count -eq 0) {
-        Write-Host "`n❌ No tenants configured." -ForegroundColor Red
-        Write-Host "   Edit the `$Tenants array at the top of this script to add your tenant domains." -ForegroundColor Yellow
+        Write-Host "`n❌ No tenants configured. Edit `$Tenants at top of script." -ForegroundColor Red
         exit 1
     }
 
     Write-Host "`nTenants to process ($($Tenants.Count)):" -ForegroundColor Yellow
     $Tenants | ForEach-Object { Write-Host "  • $_" -ForegroundColor White }
 
-    # ── Auth workflow hint ──
-    Write-Host "`n┌─────────────────────────────────────────────────────────────┐" -ForegroundColor Gray
-    Write-Host "│  AUTH WORKFLOW                                               │" -ForegroundColor Gray
-    Write-Host "│                                                              │" -ForegroundColor Gray
-    Write-Host "│  For each tenant the script will show a device login URL     │" -ForegroundColor Gray
-    Write-Host "│  and a one-time code. Copy the URL, paste it into a browser  │" -ForegroundColor Gray
-    Write-Host "│  profile already signed in as an admin for that tenant,      │" -ForegroundColor Gray
-    Write-Host "│  enter the code, and approve.                                │" -ForegroundColor Gray
-    Write-Host "│                                                              │" -ForegroundColor Gray
-    Write-Host "│  URL:  https://microsoft.com/devicelogin                     │" -ForegroundColor Gray
-    Write-Host "└─────────────────────────────────────────────────────────────┘" -ForegroundColor Gray
-
     $summary = @()
-    $tenantIndex = 0
+    $i = 0
 
     foreach ($tenant in $Tenants) {
-        $tenantIndex++
+        $i++
 
         Write-Host "`n╔══════════════════════════════════════════════════════════════╗" -ForegroundColor Magenta
-        Write-Host "║  [$tenantIndex/$($Tenants.Count)] Tenant: $tenant" -ForegroundColor Magenta
+        Write-Host "║  [$i/$($Tenants.Count)] Tenant: $tenant" -ForegroundColor Magenta
         Write-Host "╚══════════════════════════════════════════════════════════════╝" -ForegroundColor Magenta
 
-        # ── Prompt before auth so the user can switch browser profiles ──
-        Write-Host ""
-        Write-Host "  ➡️  Make sure you have a browser profile open that is signed in" -ForegroundColor Yellow
-        Write-Host "     as an Exchange/Global Admin for: $tenant" -ForegroundColor Yellow
-        Write-Host ""
-        Read-Host "  Press ENTER when ready to authenticate"
-
-        # ── Connect with device code auth ──
-        Write-Host "  Initiating device code authentication..." -ForegroundColor Cyan
-        Write-Host "  Copy the URL below and paste it into that browser profile:" -ForegroundColor Cyan
-        Write-Host ""
+        Write-Host "  Use browser profile signed in for this tenant admin." -ForegroundColor Yellow
+        Read-Host "  Press ENTER to start device auth"
 
         try {
             Connect-ExchangeOnline -Device -ShowBanner:$false -ErrorAction Stop
-            Write-Host ""
             Write-Host "  ✓ Connected to Exchange Online" -ForegroundColor Green
             Write-Log -Tenant $tenant -Step "Connect" -Status "Success"
         }
         catch {
-            Write-Host "  ✗ Failed to connect: $($_.Exception.Message)" -ForegroundColor Red
+            Write-Host "  ✗ Connect failed: $($_.Exception.Message)" -ForegroundColor Red
             Write-Log -Tenant $tenant -Step "Connect" -Status "Failed" -Detail $_.Exception.Message
-            $summary += [PSCustomObject]@{
-                Tenant  = $tenant
-                Step1   = "—"
-                Step2   = "—"
-                Step3   = "—"
-                Overall = "CONNECT FAILED"
-            }
+            $summary += [PSCustomObject]@{ Tenant = $tenant; S1="-"; S2="-"; S3="-"; S4="-"; S5="-"; S6="-"; S7="-"; S8="-"; Overall="CONNECT FAILED" }
             continue
         }
 
-        # ── Verify we're in the right tenant ──
-        try {
-            $orgConfig = Get-OrganizationConfig -ErrorAction Stop
-            $orgName = $orgConfig.DisplayName
-            $orgDomain = $orgConfig.Name
-            Write-Host "  ✓ Verified org: $orgName ($orgDomain)" -ForegroundColor Green
-            Write-Log -Tenant $tenant -Step "Verify" -Status "Info" -Detail "Org: $orgName ($orgDomain)"
+        $s1 = Set-Step1_ConnectionFilterIP -Tenant $tenant
+        $s2 = Set-Step2_IPBypassRule -Tenant $tenant
+        $s3 = Set-Step3_DMARCBypassRule -Tenant $tenant
+        $s4 = Set-Step4_SkipJunkHeaderRule -Tenant $tenant
+        $s5 = Set-Step5_AttachmentBypassRule -Tenant $tenant
+        $s6 = Set-Step6_LinkBypassRule -Tenant $tenant
+        $s7 = Set-Step7_AntiPhishTrustedDomains -Tenant $tenant
+        $s8 = Set-Step8_AdvancedDeliveryPhishSim -Tenant $tenant
 
-            # Sanity check — warn if the org domain doesn't match the expected tenant
-            if ($orgDomain -notlike "*$($tenant.Split('.')[0])*") {
-                Write-Host ""
-                Write-Host "  ⚠️  WARNING: Connected org '$orgDomain' may not match expected tenant '$tenant'" -ForegroundColor Red
-                Write-Host "  ⚠️  You may have authenticated with the wrong account." -ForegroundColor Red
-                Write-Log -Tenant $tenant -Step "Verify" -Status "Info" -Detail "MISMATCH WARNING: org=$orgDomain expected=$tenant"
-                $proceed = Read-Host "  Continue anyway? (Y/N)"
-                if ($proceed -ne "Y" -and $proceed -ne "y") {
-                    Write-Host "  Skipping tenant." -ForegroundColor Yellow
-                    Write-Log -Tenant $tenant -Step "Verify" -Status "Failed" -Detail "User aborted — tenant mismatch"
-                    Disconnect-ExchangeOnline -Confirm:$false -ErrorAction SilentlyContinue
-                    $summary += [PSCustomObject]@{
-                        Tenant  = $tenant
-                        Step1   = "—"
-                        Step2   = "—"
-                        Step3   = "—"
-                        Overall = "SKIPPED (MISMATCH)"
-                    }
-                    continue
-                }
-            }
-        }
-        catch {
-            Write-Host "  ⚠️  Could not verify tenant identity — proceeding anyway" -ForegroundColor Yellow
-            Write-Log -Tenant $tenant -Step "Verify" -Status "Info" -Detail "Could not get org config: $($_.Exception.Message)"
-        }
-
-        # ── Execute the 3 trust-listing steps ──
-        $s1 = Set-Step1_ConnectionFilterIP   -Tenant $tenant
-        $s2 = Set-Step2_IPBypassRule         -Tenant $tenant
-        $s3 = Set-Step3_DMARCBypassRule      -Tenant $tenant
-
-        $overall = if ($s1 -and $s2 -and $s3) { "ALL OK" } else { "PARTIAL" }
+        $okCount = @($s1,$s2,$s3,$s4,$s5,$s6,$s7,$s8 | Where-Object { $_ -eq $true }).Count
+        $overall = if ($okCount -eq 8) { "ALL OK" } elseif ($okCount -eq 0) { "FAILED" } else { "PARTIAL" }
 
         $summary += [PSCustomObject]@{
             Tenant  = $tenant
-            Step1   = $(if ($s1) { "✓" } else { "✗" })
-            Step2   = $(if ($s2) { "✓" } else { "✗" })
-            Step3   = $(if ($s3) { "✓" } else { "✗" })
+            S1      = $(if ($s1) {"✓"} else {"✗"})
+            S2      = $(if ($s2) {"✓"} else {"✗"})
+            S3      = $(if ($s3) {"✓"} else {"✗"})
+            S4      = $(if ($s4) {"✓"} else {"✗"})
+            S5      = $(if ($s5) {"✓"} else {"✗"})
+            S6      = $(if ($s6) {"✓"} else {"✗"})
+            S7      = $(if ($s7) {"✓"} else {"✗"})
+            S8      = $(if ($s8) {"✓"} else {"✗"})
             Overall = $overall
         }
 
-        # ── Disconnect before next tenant ──
-        try {
-            Disconnect-ExchangeOnline -Confirm:$false -ErrorAction SilentlyContinue
-            Write-Host "`n  ✓ Disconnected from $tenant" -ForegroundColor Green
-        }
-        catch {
-            Write-Host "  ⚠️  Disconnect warning: $($_.Exception.Message)" -ForegroundColor Yellow
-        }
+        Disconnect-ExchangeOnline -Confirm:$false -ErrorAction SilentlyContinue
+        try { Disconnect-IPPSSession -Confirm:$false -ErrorAction SilentlyContinue | Out-Null } catch {}
+
+        Write-Host "`n  ✓ Tenant complete: $tenant" -ForegroundColor Green
     }
 
-    # ── Final Summary ──
-    Write-Host ""
-    Write-Host "╔══════════════════════════════════════════════════════════════╗" -ForegroundColor Cyan
-    Write-Host "║                     DEPLOYMENT SUMMARY                      ║" -ForegroundColor Cyan
+    Write-Host "`n╔══════════════════════════════════════════════════════════════╗" -ForegroundColor Cyan
+    Write-Host "║                         SUMMARY                             ║" -ForegroundColor Cyan
     Write-Host "╚══════════════════════════════════════════════════════════════╝" -ForegroundColor Cyan
-    Write-Host ""
 
-    # Column headers
-    Write-Host ("  {0,-40} {1,-7} {2,-7} {3,-7} {4}" -f "Tenant", "Step1", "Step2", "Step3", "Overall") -ForegroundColor White
-    Write-Host ("  {0,-40} {1,-7} {2,-7} {3,-7} {4}" -f "──────", "─────", "─────", "─────", "───────") -ForegroundColor Gray
+    Write-Host ("  {0,-32} {1,2} {2,2} {3,2} {4,2} {5,2} {6,2} {7,2} {8,2}   {9}" -f "Tenant","1","2","3","4","5","6","7","8","Overall") -ForegroundColor White
+    Write-Host ("  {0,-32} {1,2} {2,2} {3,2} {4,2} {5,2} {6,2} {7,2} {8,2}   {9}" -f "------","-","-","-","-","-","-","-","-","-------") -ForegroundColor Gray
 
     foreach ($row in $summary) {
         $color = switch ($row.Overall) {
-            "ALL OK"  { "Green"  }
+            "ALL OK" { "Green" }
             "PARTIAL" { "Yellow" }
-            default   { "Red"    }
+            default { "Red" }
         }
-        Write-Host ("  {0,-40} {1,-7} {2,-7} {3,-7} {4}" -f $row.Tenant, $row.Step1, $row.Step2, $row.Step3, $row.Overall) -ForegroundColor $color
+
+        Write-Host ("  {0,-32} {1,2} {2,2} {3,2} {4,2} {5,2} {6,2} {7,2} {8,2}   {9}" -f $row.Tenant,$row.S1,$row.S2,$row.S3,$row.S4,$row.S5,$row.S6,$row.S7,$row.S8,$row.Overall) -ForegroundColor $color
     }
 
-    Write-Host ""
-    Write-Host "  Log file: $logFile" -ForegroundColor Gray
-    Write-Host ""
-
-    # ── Legend ──
-    Write-Host "  Step 1 = Connection Filter IP Allow List" -ForegroundColor Gray
-    Write-Host "  Step 2 = Transport Rule: Bypass Spam (Sender IP + BypassClutter)" -ForegroundColor Gray
-    Write-Host "  Step 3 = Transport Rule: DMARC Bypass (27 domains + IP + Auth-Results)" -ForegroundColor Gray
-    Write-Host ""
+    Write-Host "`n  Log file: $logFile" -ForegroundColor Gray
+    Write-Host "  Steps: 1=ConnFilter, 2=BypassClutter, 3=DMARC, 4=SkipJunk, 5=SkipAttach, 6=SkipLinks, 7=AntiPhish, 8=AdvancedDelivery" -ForegroundColor Gray
 }
 
 #endregion
 
-# ── Entry Point ──
 try {
     Main
 }
 finally {
-    # Ensure we always disconnect, even on unexpected errors
     Disconnect-ExchangeOnline -Confirm:$false -ErrorAction SilentlyContinue 2>$null
+    try { Disconnect-IPPSSession -Confirm:$false -ErrorAction SilentlyContinue | Out-Null } catch {}
 }
